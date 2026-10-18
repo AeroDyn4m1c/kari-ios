@@ -1,22 +1,34 @@
 #!/bin/sh
 # kari installer for iSH (iPhone / iPad). Also works on Alpine / other Linux.
 #   curl -sL https://raw.githubusercontent.com/AeroDyn4m1c/kari-ios/main/install.sh | sh
-set -e
 
 repo="${KARI_REPO:-AeroDyn4m1c/kari-ios}"
 dest="${KARI_INSTALL_DIR:-/usr/local/bin}"
 
 if command -v apk >/dev/null 2>&1; then
+    echo "Updating package lists..."
+    apk update
     echo "Installing dependencies (curl jq openssl fzf busybox-extras)..."
-    apk add -q curl jq openssl fzf busybox-extras
-else
-    for d in curl jq openssl; do
-        command -v "$d" >/dev/null 2>&1 || { echo "Please install $d first."; exit 1; }
-    done
+    # apk can print "broken packages" warnings for unrelated packages; check the result below instead
+    apk add curl jq openssl fzf busybox-extras
 fi
+
+missing=""
+for d in curl jq openssl; do
+    command -v "$d" >/dev/null 2>&1 || missing="$missing $d"
+done
+if command -v apk >/dev/null 2>&1 && ! busybox-extras --list 2>/dev/null | grep -qx httpd; then
+    missing="$missing busybox-extras"
+fi
+if [ -n "$missing" ]; then
+    echo "Could not install:$missing"
+    echo "Try: apk update && apk add$missing"
+    exit 1
+fi
+command -v fzf >/dev/null 2>&1 || echo "Note: fzf is not installed, kari will use numbered menus instead."
 
 mkdir -p "$dest"
 echo "Downloading kari to $dest/kari..."
-curl -sfL "https://raw.githubusercontent.com/$repo/main/kari" -o "$dest/kari"
+curl -sfL "https://raw.githubusercontent.com/$repo/main/kari" -o "$dest/kari" || { echo "Download failed."; exit 1; }
 chmod +x "$dest/kari"
 echo "Done! Run: kari"
