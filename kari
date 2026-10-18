@@ -6,7 +6,7 @@
 # VLC for iOS cannot send the Referer header the CDN requires, so on iSH the
 # stream is played through a tiny local proxy (busybox httpd + CGI) that adds it.
 
-version_number="1.0.0"
+version_number="1.1.0"
 
 # ---------- configuration (override with environment variables) ----------
 mode="${KARI_MODE:-sub}"                    # sub | dub
@@ -31,6 +31,7 @@ cdn_secret='MpCdnT0k3n!9f2K#xQ7vL5mR8wN1pY4s'
 die() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
 info() { printf '\033[1;35m%s\033[0m\n' "$*" >&2; }
 has() { command -v "$1" >/dev/null 2>&1; }
+step() { if [ -n "$KARI_DEBUG" ]; then info "[+$(($(date +%s) - ${t0:-0}))s] $*"; else info "$*"; fi; }
 
 # menu PROMPT: reads "key<TAB>...<TAB>label" lines on stdin, shows the last
 # field, prints the chosen full line. Uses fzf when installed, else a numbered list.
@@ -52,9 +53,9 @@ prompt() { printf '\033[1;33m%s\033[0m' "$1" >&2; read -r _reply </dev/tty; prin
 
 uri() { jq -rn --arg s "$1" '$s|@uri'; }
 
-b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+b64url() { base64 | tr -d '\n=' | tr '+/' '-_'; }
 
-get() { curl -sfL --max-time 30 -A "$agent" "$@"; }
+get() { curl -sfL --connect-timeout 15 --max-time 30 -A "$agent" "$@"; }
 
 detect_player() {
     [ -n "$player" ] && return
@@ -69,7 +70,7 @@ detect_player() {
 }
 
 dep_check() {
-    for d in curl jq openssl sed awk grep; do
+    for d in curl jq openssl base64 sed awk grep; do
         has "$d" || die "Missing dependency: $d  (on iSH: apk add curl jq openssl)"
     done
     if [ "$player" = "iSH" ]; then
@@ -108,6 +109,7 @@ resolve_episode() { # MAL_ID EPISODE MODE
         info "Episode $2 ($3) is not available."
         return 1
     fi
+    step "Getting stream..."
     _src=$(get -e "$_embed" -H 'X-Requested-With: XMLHttpRequest' "$megaplay/stream/getSources?id=$_fid") ||
         { info "getSources request failed."; return 1; }
     _enc=$(printf '%s' "$_src" | jq -r '.enc // empty' | tr -- '-_' '+/')
@@ -138,7 +140,13 @@ sign_cdn_url() {
 }
 
 # ---------- local proxy (iSH) ----------
+# VLC asks the proxy for f?ID-N.ts. A background prefetcher downloads the next
+# segments ahead of playback (reusing one connection per batch, which matters on
+# iSH where every TLS handshake is slow) into ID/N.ts; the CGI serves those with
+# a Content-Length, falling back to fetching the segment itself after a seek.
 www="$cache_dir/www"
+proxy_log="$cache_dir/proxy.log"
+ahead="${KARI_AHEAD:-8}" # segments to keep buffered ahead of VLC (~10s each)
 
 httpd_cmd() {
     if has busybox-extras && busybox-extras --list 2>/dev/null | grep -qx httpd; then echo "busybox-extras httpd"
@@ -150,21 +158,38 @@ httpd_cmd() {
 start_proxy() {
     mkdir -p "$www/cgi-bin"
     if [ -z "$proxy_ready" ]; then
-        rm -f "$www"/*.m3u8 "$www"/*.urls "$www"/*.ref "$www"/*.vtt
+        rm -rf "$www"/[0-9]*
         printf 'kari\n' >"$www/kari.txt"
+        : >"$proxy_log"
     fi
     printf '.m3u8:application/vnd.apple.mpegurl\n.vtt:text/vtt\n' >"$cache_dir/httpd.conf"
-    # f?ID-N.ts -> line N of ID.urls, fetched with ID.ref as Referer
     cat >"$www/cgi-bin/f" <<EOF
 #!/bin/sh
 q="\$QUERY_STRING"; id="\${q%%-*}"; n="\${q#*-}"; n="\${n%.ts}"
 case "\$id" in ''|*[!0-9]*) printf 'Status: 400 Bad Request\r\n\r\n'; exit 0;; esac
 case "\$n" in ''|*[!0-9]*) printf 'Status: 400 Bad Request\r\n\r\n'; exit 0;; esac
-url=\$(sed -n "\${n}p" "$www/\$id.urls")
-ref=\$(cat "$www/\$id.ref" 2>/dev/null)
-[ -z "\$url" ] && { printf 'Status: 404 Not Found\r\n\r\n'; exit 0; }
-printf 'Content-Type: video/mp2t\r\nConnection: close\r\n\r\n'
-exec curl -sL --max-time 120 -A '$agent' -e "\$ref" "\$url"
+d="$www/\$id"; f="\$d/\$n.ts"
+[ -d "\$d" ] || { printf 'Status: 404 Not Found\r\n\r\n'; exit 0; }
+printf '%s\n' "\$n" >"$www/\$id.pos"
+i=0
+while [ ! -s "\$f" ] && [ -e "\$f.part" ] && [ \$i -lt 60 ]; do sleep 0.5; i=\$((i + 1)); done
+src=buffer
+if [ ! -s "\$f" ]; then
+    src=direct
+    url=\$(sed -n "\${n}p" "$www/\$id.urls")
+    [ -z "\$url" ] && { printf 'Status: 404 Not Found\r\n\r\n'; exit 0; }
+    if curl -sfL --connect-timeout 15 --max-time 60 -A '$agent' -e "\$(cat "$www/\$id.ref")" -o "\$f.cgi" "\$url" && [ -s "\$f.cgi" ]; then
+        mv -f "\$f.cgi" "\$f"
+    else
+        rm -f "\$f.cgi"
+        echo "\$(date +%T) seg \$n FAILED (curl)" >>"$proxy_log"
+        printf 'Status: 502 Bad Gateway\r\n\r\n'; exit 0
+    fi
+fi
+len=\$(wc -c <"\$f")
+echo "\$(date +%T) seg \$n \$src \$len bytes" >>"$proxy_log"
+printf 'Content-Type: video/mp2t\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' "\$len"
+exec cat "\$f"
 EOF
     chmod +x "$www/cgi-bin/f"
     # a server already answering for kari (e.g. left over from an earlier run) serves the same directory
@@ -182,17 +207,72 @@ EOF
     die "Local proxy failed to start on port $port (is it in use? set KARI_PORT)"
 }
 
+# Download segments of episode ID ahead of the position VLC last asked for.
+prefetch() { # ID
+    _pid="$1"
+    _pd="$www/$_pid"
+    _ptotal=$(wc -l <"$www/$_pid.urls")
+    _pref=$(cat "$www/$_pid.ref")
+    _pn=1
+    while [ "$_pn" -le "$_ptotal" ] && [ -d "$_pd" ]; do
+        _pos=$(cat "$www/$_pid.pos" 2>/dev/null)
+        case "$_pos" in '' | *[!0-9]*) _pos=0 ;; esac
+        [ "$_pn" -lt "$_pos" ] && _pn=$_pos # VLC seeked forward
+        if [ "$_pn" -gt $((_pos + ahead)) ]; then sleep 1; continue; fi
+        # forget segments well behind the viewer
+        for _f in "$_pd"/*.ts; do
+            [ -e "$_f" ] || continue
+            _b="${_f##*/}"; _b="${_b%.ts}"
+            [ "$_b" -lt $((_pos - 2)) ] && rm -f "$_f"
+        done
+        set --
+        _batch=""
+        _k=0
+        while [ $_k -lt 4 ] && [ $((_pn + _k)) -le "$_ptotal" ]; do
+            _m=$((_pn + _k))
+            if [ ! -s "$_pd/$_m.ts" ]; then
+                : >"$_pd/$_m.ts.part"
+                set -- "$@" "$(sed -n "${_m}p" "$www/$_pid.urls")" -o "$_pd/$_m.ts.part"
+                _batch="$_batch $_m"
+            fi
+            _k=$((_k + 1))
+        done
+        if [ -n "$_batch" ]; then
+            curl -sfL --connect-timeout 15 --max-time 180 -A "$agent" -e "$_pref" "$@" 2>/dev/null
+            for _m in $_batch; do
+                if [ -s "$_pd/$_m.ts.part" ]; then mv -f "$_pd/$_m.ts.part" "$_pd/$_m.ts"
+                else rm -f "$_pd/$_m.ts.part"; echo "$(date +%T) prefetch seg $_m FAILED" >>"$proxy_log"; fi
+            done
+        fi
+        _pn=$((_pn + _k))
+    done
+}
+
+stop_prefetch() {
+    [ -n "$prefetch_pid" ] && kill "$prefetch_pid" 2>/dev/null
+    prefetch_pid=""
+}
+
 # Keep iSH running in the background while VLC plays (needs location permission).
 start_keepalive() {
-    [ -n "$keepalive_pid" ] && kill -0 "$keepalive_pid" 2>/dev/null && return
     [ -n "$KARI_NO_KEEPALIVE" ] && return
-    if [ -e /dev/location ]; then
-        cat /dev/location >/dev/null 2>&1 &
-        keepalive_pid=$!
+    [ -n "$keepalive_pid" ] && kill -0 "$keepalive_pid" 2>/dev/null && return
+    if [ ! -e /dev/location ]; then
+        info "Warning: /dev/location not found, iSH may pause when VLC is open. Update iSH."
+        return
+    fi
+    cat /dev/location >/dev/null 2>&1 &
+    keepalive_pid=$!
+    sleep 1
+    if ! kill -0 "$keepalive_pid" 2>/dev/null; then
+        keepalive_pid=""
+        info "Warning: iSH can't stay awake in the background (location access denied)."
+        info "Fix: iOS Settings > iSH > Location > Always (or While Using), then run kari again."
     fi
 }
 
 cleanup() {
+    stop_prefetch
     [ -n "$proxy_pid" ] && kill "$proxy_pid" 2>/dev/null
     [ -n "$keepalive_pid" ] && kill "$keepalive_pid" 2>/dev/null
 }
@@ -228,11 +308,15 @@ pick_variant() { # MASTER_TEXT
         }'
 }
 
-# Build a local playlist whose segments/keys go through the proxy. Sets local_url, local_sub.
+# Build a local playlist whose segments/keys go through the proxy, start the
+# prefetcher and check that the first segment really comes through.
+# Sets local_url, local_sub.
 prepare_local() {
     start_proxy
+    stop_prefetch
     _id=$(date +%s)
     local_url="" local_sub=""
+    step "Loading playlist..."
     _m=$(get -e "$stream_ref" "$stream_url") || { info "Could not fetch playlist."; return 1; }
     printf '%s' "$_m" | grep -q '#EXTM3U' || { info "Stream did not return a playlist."; return 1; }
     _purl="$stream_url"
@@ -243,6 +327,12 @@ prepare_local() {
     fi
     _origin=$(printf '%s' "$_purl" | sed -E 's#^(https?://[^/]+).*#\1#')
     _dir=$(printf '%s' "${_purl%%\?*}" | sed 's#/[^/]*$##')
+    # drop older episodes' files
+    for _old in "$www"/[0-9]*.urls; do
+        [ -e "$_old" ] || continue
+        _b="${_old%.urls}"; rm -rf "$_b" "$_b.m3u8" "$_b.urls" "$_b.ref" "$_b.vtt" "$_b.pos"
+    done
+    mkdir -p "$www/$_id"
     printf '%s' "$stream_ref" >"$www/$_id.ref"
     : >"$www/$_id.urls"
     printf '%s\n' "$_m" | tr -d '\r' | awk -v origin="$_origin" -v dir="$_dir" -v urls="$www/$_id.urls" \
@@ -264,18 +354,36 @@ prepare_local() {
         { print prox($0) }' >"$www/$_id.m3u8"
     [ -s "$www/$_id.urls" ] || { info "Playlist has no segments."; return 1; }
     local_url="http://127.0.0.1:$port/$_id.m3u8"
-    if [ -n "$sub_url" ] && get -e "$stream_ref" -o "$www/$_id.vtt" "$sub_url"; then
-        local_sub="http://127.0.0.1:$port/$_id.vtt"
+
+    prefetch "$_id" &
+    prefetch_pid=$!
+
+    if [ -n "$sub_url" ]; then
+        step "Loading subtitles..."
+        get -e "$stream_ref" -o "$www/$_id.vtt" "$sub_url" && local_sub="http://127.0.0.1:$port/$_id.vtt"
     fi
-    # keep only the last few episodes' files
-    ls -t "$www"/*.m3u8 2>/dev/null | tail -n +4 | while read -r _old; do
-        _b="${_old%.m3u8}"; rm -f "$_b.m3u8" "$_b.urls" "$_b.ref" "$_b.vtt"
-    done
+
+    # Self-test: fetch the playlist and first segment through the proxy like VLC will.
+    step "Buffering..."
+    _t=$(date +%s)
+    if ! curl -sf --max-time 10 -o /dev/null "$local_url"; then
+        info "The local proxy is not serving the playlist (see $proxy_log)."
+        return 1
+    fi
+    _first=$(awk '!/^#/ && NF { print; exit }' "$www/$_id.m3u8")
+    _len=$(curl -sf --max-time 90 -o /dev/null -w '%{size_download}' "$_first") || _len=0
+    rm -f "$www/$_id.pos" # the self-test is not VLC's position
+    if [ "${_len:-0}" -lt 1000 ]; then
+        info "Could not download video through the proxy (see $proxy_log)."
+        return 1
+    fi
+    step "Ready: first segment $((_len / 1024)) KB in $(($(date +%s) - _t))s, buffering ahead in the background."
 }
 
 # ---------- playback ----------
 play_episode() {
-    info "Fetching $title - episode $ep ($mode)..."
+    t0=$(date +%s)
+    step "Fetching $title - episode $ep ($mode)..."
     resolve_episode "$mal_id" "$ep" "$mode" || return 1
     update_history
     case "$player" in
@@ -285,7 +393,10 @@ play_episode() {
             _x="vlc-x-callback://x-callback-url/stream?url=$(uri "$local_url")"
             [ -n "$local_sub" ] && _x="$_x&sub=$(uri "$local_sub")"
             printf '\n\033]8;;%s\a\033[1;32m~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n~  Tap here to open in VLC  ~\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\033[0m\033]8;;\a\n' "$_x"
-            printf '\033[2m%s - Episode %s/%s (%s)\nKeep iSH running in the background while you watch.\033[0m\n\n' "$title" "$ep" "$ep_count" "$mode"
+            printf '\033[2m%s - Episode %s/%s (%s)\nKeep iSH open in the background while you watch.\033[0m\n' "$title" "$ep" "$ep_count" "$mode"
+            # fzf takes over the screen, so wait here or the link above gets hidden
+            printf '\033[1;33mAfter opening VLC, come back and press Enter for the menu.\033[0m' >&2
+            read -r _ </dev/tty
             ;;
         mpv)
             mpv --force-media-title="$title - Episode $ep" --referrer="$stream_ref" --user-agent="$agent" \

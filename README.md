@@ -52,8 +52,9 @@ kari -h              # all options
 ```
 
 1. Pick the anime and the episode. Type to filter, then tap the item or press Enter.
-2. **Tap the green "Tap here to open in VLC" box.** VLC opens and starts playing, with English subtitles in sub mode.
-3. When you're done, switch back to iSH and choose **next**, **replay**, **previous**, **select**, **switch to dub/sub**, **quality**, **search** or **quit**.
+2. Wait for **"Ready: first segment ..."**. kari checks that the video really comes through before it shows the link.
+3. **Tap the green "Tap here to open in VLC" box.** VLC opens and starts playing, with English subtitles in sub mode.
+4. When you're done, switch back to iSH and press **Enter**, then choose **next**, **replay**, **previous**, **select**, **switch to dub/sub**, **quality**, **search** or **quit**.
 
 ### First run: allow location access
 
@@ -70,7 +71,9 @@ kari follows the same anime pipeline as the original kari's AniCine provider:
 3. Ask Megaplay for the sources and decrypt the AES token with `openssl`, which yields the HLS playlist.
 4. Sign the CDN URL (HMAC-SHA256), as kari does.
 
-The stream's CDN refuses any request without a `Referer` header, and VLC for iOS can't send one. On iSH, kari therefore starts a tiny proxy on `127.0.0.1:8642` (busybox `httpd` + a CGI script). The proxy fetches each video segment with the right headers, and VLC plays `http://127.0.0.1:8642/...`. That's why iSH has to stay alive in the background while VLC plays.
+The stream's CDN refuses any request without a `Referer` header, and VLC for iOS can't send one. On iSH, kari therefore starts a tiny proxy on `127.0.0.1:8642` (busybox `httpd` + a CGI script), and VLC plays `http://127.0.0.1:8642/...`.
+
+A background job downloads the next ~80 seconds of video ahead of VLC, with the right headers and one connection per batch, because every new connection is slow inside iSH. Segments VLC has already played get deleted, so storage use stays small. All of this is why iSH has to stay alive in the background while VLC plays.
 
 On a normal Linux/macOS machine kari skips the proxy and starts `mpv` or `vlc` directly with the headers.
 
@@ -87,12 +90,15 @@ Set these as environment variables, e.g. in `~/.profile`:
 | `KARI_PLAYER` | auto | `iSH`, `mpv`, `vlc`, or `link` (just print the stream URL) |
 | `KARI_NO_FZF` | | set to use a numbered menu instead of fzf |
 | `KARI_NO_KEEPALIVE` | | set to skip the location background trick |
+| `KARI_AHEAD` | `8` | how many segments (~10 s each) to buffer ahead of VLC |
+| `KARI_DEBUG` | | set to show how long each step takes |
 
 History is stored in `~/.local/state/kari/history`.
 
 ## Troubleshooting
 
-- **VLC opens but nothing plays / stops after a few seconds.** iSH was suspended. Allow location access for iSH (Settings → iSH → Location), and don't force-close iSH while watching.
+- **VLC opens but nothing plays / stops after a few seconds.** iSH was suspended. Allow location access for iSH (Settings → iSH → Location → **Always**), and don't force-close iSH while watching. To see what the proxy did, run `cat ~/.cache/kari/proxy.log`: every line is one piece of video VLC asked for.
+- **Slow to start.** Run `KARI_DEBUG=1 kari frieren` to see which step takes long. Lower quality (`kari -q 720 ...`) also buffers faster.
 - **"Episode N (dub) is not available"**: that episode has no dub yet. Switch to sub.
 - **"Local proxy failed to start"**: another program is using the port. Run `KARI_PORT=8700 kari`.
 - **Nothing tappable appears**: update iSH. Older versions don't support terminal links.
