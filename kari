@@ -6,7 +6,7 @@
 # VLC for iOS cannot send the Referer header the CDN requires, so on iSH the
 # stream is played through a tiny local proxy (busybox httpd + CGI) that adds it.
 
-version_number="1.1.0"
+version_number="1.1.1"
 
 # ---------- configuration (override with environment variables) ----------
 mode="${KARI_MODE:-sub}"                    # sub | dub
@@ -354,6 +354,21 @@ prepare_local() {
         { print prox($0) }' >"$www/$_id.m3u8"
     [ -s "$www/$_id.urls" ] || { info "Playlist has no segments."; return 1; }
     local_url="http://127.0.0.1:$port/$_id.m3u8"
+
+    # Fail fast with a clear message when the network can't reach the video CDN.
+    _seg1=$(head -n 1 "$www/$_id.urls")
+    _host=$(printf '%s' "$_seg1" | sed -E 's#^https?://([^/:]+).*#\1#')
+    step "Checking connection to the video server..."
+    # a slow download can time out too, so only treat "no HTTP answer at all" as blocked
+    _code=$(curl -s -o /dev/null --connect-timeout 8 --max-time 10 -w '%{http_code}' -r 0-0 -A "$agent" -e "$stream_ref" "$_seg1")
+    case "$?:$_code" in
+        6:000 | 7:000 | 28:000 | 35:000)
+            info "Can't connect to the video server ($_host)."
+            info "Your network (Wi-Fi or internet provider) is blocking it; this is not a kari problem."
+            info "Try mobile data or another Wi-Fi network."
+            return 1
+            ;;
+    esac
 
     prefetch "$_id" &
     prefetch_pid=$!
