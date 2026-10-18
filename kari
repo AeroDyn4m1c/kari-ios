@@ -6,7 +6,7 @@
 # VLC for iOS cannot send the Referer header the CDN requires, so on iSH the
 # stream is played through a tiny local proxy (busybox httpd + CGI) that adds it.
 
-version_number="1.1.1"
+version_number="1.1.2"
 
 # ---------- configuration (override with environment variables) ----------
 mode="${KARI_MODE:-sub}"                    # sub | dub
@@ -366,6 +366,8 @@ prepare_local() {
             info "Can't connect to the video server ($_host)."
             info "Your network (Wi-Fi or internet provider) is blocking it; this is not a kari problem."
             info "Try mobile data or another Wi-Fi network."
+            info "In Spain, providers block Cloudflare addresses during LaLiga matches;"
+            info "if so, it works again after the matches (status: https://hayahora.futbol)."
             return 1
             ;;
     esac

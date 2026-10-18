@@ -98,7 +98,7 @@ History is stored in `~/.local/state/kari/history`.
 ## Troubleshooting
 
 - **VLC opens but nothing plays / stops after a few seconds.** iSH was suspended. Allow location access for iSH (Settings → iSH → Location → **Always**), and don't force-close iSH while watching. To see what the proxy did, run `cat ~/.cache/kari/proxy.log`: every line is one piece of video VLC asked for.
-- **"Can't connect to the video server"**: your Wi-Fi or internet provider blocks the address the video CDN uses. kari can't fix that. Try mobile data or another network.
+- **"Can't connect to the video server"**: your Wi-Fi or internet provider blocks the address the video CDN uses. kari can't fix that. Try mobile data or another network. **In Spain**, all big providers (Movistar, Vodafone, Orange, Digi, MásMóvil) block Cloudflare addresses during LaLiga matches, on home internet and mobile data alike. The block lifts after the matches, usually the same evening. Live status: [hayahora.futbol](https://hayahora.futbol).
 - **Slow to start.** Run `KARI_DEBUG=1 kari frieren` to see which step takes long. Lower quality (`kari -q 720 ...`) also buffers faster.
 - **"Episode N (dub) is not available"**: that episode has no dub yet. Switch to sub.
 - **"Local proxy failed to start"**: another program is using the port. Run `KARI_PORT=8700 kari`.
