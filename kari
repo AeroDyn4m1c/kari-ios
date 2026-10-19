@@ -6,7 +6,7 @@
 # VLC for iOS cannot send the Referer header the CDN requires, so on iSH the
 # stream is played through a tiny local proxy (busybox httpd + CGI) that adds it.
 
-version_number="1.1.4"
+version_number="1.1.5"
 
 # ---------- configuration (override with environment variables) ----------
 mode="${KARI_MODE:-sub}"                    # sub | dub
@@ -533,6 +533,35 @@ play_and_pause() {
     read -r _ </dev/tty
 }
 
+# ---------- proxy diagnostics (kari --test-proxy) ----------
+# Times plain files and CGI responses through a separate, verbose busybox httpd,
+# to see which kinds of responses reach the client on this device.
+test_proxy() {
+    _h=$(httpd_cmd) || die "busybox httpd not found (apk add busybox-extras)"
+    _tp=$((port + 1))
+    _tw="$cache_dir/proxy-test"
+    _tlog="$cache_dir/proxy-test.log"
+    rm -rf "$_tw"; mkdir -p "$_tw/cgi-bin"
+    printf 'ok\n' >"$_tw/small.txt"
+    head -c 800000 /dev/urandom >"$_tw/big.ts"
+    printf '#!/bin/sh\nprintf "Content-Type: text/plain\\r\\n\\r\\nok\\n"\n' >"$_tw/cgi-bin/tiny"
+    printf '#!/bin/sh\nprintf "Content-Type: video/mp2t\\r\\nContent-Length: 800000\\r\\n\\r\\n"\nexec cat "%s/big.ts"\n' "$_tw" >"$_tw/cgi-bin/big"
+    printf '#!/bin/sh\nprintf "Status: 302 Found\\r\\nLocation: http://127.0.0.1:%s/big.ts\\r\\nContent-Length: 0\\r\\n\\r\\n"\n' "$_tp" >"$_tw/cgi-bin/redirect"
+    chmod +x "$_tw/cgi-bin/"*
+    $_h -f -vv -p "127.0.0.1:$_tp" -h "$_tw" >"$_tlog" 2>&1 &
+    _tpid=$!
+    sleep 2
+    info "kari $version_number, $($_h --help 2>&1 | head -n 1), $(uname -sm)"
+    for _t in small.txt big.ts cgi-bin/tiny cgi-bin/big cgi-bin/redirect; do
+        _r=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code} %{size_download} %{time_total}' "http://127.0.0.1:$_tp/$_t")
+        printf '%-17s curl exit %s, http %s, %s bytes, %ss\n' "$_t" "$?" ${_r:-000 0 0}
+    done
+    kill "$_tpid" 2>/dev/null
+    info "httpd log ($_tlog):"
+    cat "$_tlog"
+    exit 0
+}
+
 # ---------- self update ----------
 update_script() {
     _url="https://raw.githubusercontent.com/$repo/main/kari"
@@ -561,6 +590,7 @@ Options:
   -p, --player P        iSH | mpv | vlc | link  (default: auto)
   -D, --delete-history  clear watch history
   -U, --update          update kari to the latest version
+      --test-proxy      check which local proxy responses work on this device
   -V, --version         print version
   -h, --help            show this help
 
@@ -586,6 +616,7 @@ while [ $# -gt 0 ]; do
         -D | --delete-history) rm -f "$hist_file"; info "History deleted."; exit 0 ;;
         -U | --update) update_script ;;
         -V | --version) echo "$version_number"; exit 0 ;;
+        --test-proxy) test_proxy ;;
         -h | --help) usage; exit 0 ;;
         -*) die "Unknown option: $1 (see kari -h)" ;;
         *) query="${query:+$query }$1" ;;
