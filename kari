@@ -6,7 +6,7 @@
 # VLC for iOS cannot send the Referer header the CDN requires, so on iSH the
 # stream is played through a tiny local proxy (busybox httpd + CGI) that adds it.
 
-version_number="1.1.3"
+version_number="1.1.4"
 
 # ---------- configuration (override with environment variables) ----------
 mode="${KARI_MODE:-sub}"                    # sub | dub
@@ -142,8 +142,8 @@ sign_cdn_url() {
 # ---------- local proxy (iSH) ----------
 # VLC asks the proxy for f?ID-N.ts. A background prefetcher downloads the next
 # segments ahead of playback (reusing one connection per batch, which matters on
-# iSH where every TLS handshake is slow) into ID/N.ts; the CGI serves those with
-# a Content-Length, falling back to fetching the segment itself after a seek.
+# iSH where every TLS handshake is slow) into ID/N.ts; the CGI redirects to those
+# files (served by httpd itself), fetching the segment first after a seek.
 www="$cache_dir/www"
 proxy_log="$cache_dir/proxy.log"
 ahead="${KARI_AHEAD:-8}" # segments to keep buffered ahead of VLC (~10s each)
@@ -162,7 +162,7 @@ start_proxy() {
         printf 'kari\n' >"$www/kari.txt"
         : >"$proxy_log"
     fi
-    printf '.m3u8:application/vnd.apple.mpegurl\n.vtt:text/vtt\n' >"$cache_dir/httpd.conf"
+    printf '.m3u8:application/vnd.apple.mpegurl\n.vtt:text/vtt\n.ts:video/mp2t\n' >"$cache_dir/httpd.conf"
     cat >"$www/cgi-bin/f" <<EOF
 #!/bin/sh
 q="\$QUERY_STRING"; id="\${q%%-*}"; n="\${q#*-}"; n="\${n%.ts}"
@@ -188,8 +188,8 @@ if [ ! -s "\$f" ]; then
 fi
 len=\$(wc -c <"\$f")
 echo "\$(date +%T) seg \$n \$src \$len bytes" >>"$proxy_log"
-printf 'Content-Type: video/mp2t\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' "\$len"
-exec cat "\$f"
+# on iSH httpd stalls passing a large CGI response through, so redirect to the file instead
+printf 'Status: 302 Found\r\nLocation: http://127.0.0.1:$port/%s/%s.ts\r\nContent-Length: 0\r\n\r\n' "\$id" "\$n"
 EOF
     chmod +x "$www/cgi-bin/f"
     # a server already answering for kari (e.g. left over from an earlier run) serves the same directory
@@ -385,7 +385,7 @@ prepare_local() {
         return 1
     fi
     _first=$(awk '!/^#/ && NF { print; exit }' "$www/$_id.m3u8")
-    _res=$(curl -s --max-time 90 -o /dev/null -w '%{http_code} %{size_download}' "$_first")
+    _res=$(curl -sL --max-time 90 -o /dev/null -w '%{http_code} %{size_download}' "$_first")
     _rc=$?
     _code=${_res%% *} _len=${_res#* }
     rm -f "$www/$_id.pos" # the self-test is not VLC's position
