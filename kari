@@ -6,7 +6,7 @@
 # VLC for iOS cannot send the Referer header the CDN requires, so on iSH the
 # stream is played through a tiny local proxy (busybox httpd + CGI) that adds it.
 
-version_number="1.2.0"
+version_number="1.2.1"
 
 # ---------- configuration (override with environment variables) ----------
 mode="${KARI_MODE:-sub}"                    # sub | dub
@@ -186,22 +186,32 @@ vlc_pos() { # ID
 }
 
 # Download segments of episode ID ahead of the position VLC last asked for.
+# Each round starts again from VLC's position, so seeks in either direction work.
 prefetch() { # ID
     _pid="$1"
     _pd="$www/$_pid"
+    _wo="$_pd.wout"
     _ptotal=$(wc -l <"$www/$_pid.urls")
     _pref=$(cat "$www/$_pid.ref")
-    _pn=1 _tries=0
-    while [ "$_pn" -le "$_ptotal" ] && [ -d "$_pd" ]; do
+    _fail="" _tries=0
+    while [ -d "$_pd" ]; do
         _pos=$(vlc_pos "$_pid")
-        [ "$_pn" -lt "$_pos" ] && _pn=$_pos # VLC seeked forward
-        if [ "$_pn" -gt $((_pos + ahead)) ]; then sleep 1; continue; fi
+        [ "$_pos" -lt 1 ] && _pos=1
         # forget segments well behind the viewer
         for _f in "$_pd"/*.ts; do
             [ -e "$_f" ] || continue
             _b="${_f##*/}"; _b="${_b%.ts}"
             [ "$_b" -lt $((_pos - 2)) ] && rm -f "$_f"
         done
+        # first missing segment within reach of the viewer
+        _pn=$_pos
+        while [ "$_pn" -le "$_ptotal" ] && [ "$_pn" -le $((_pos + ahead)) ] && [ -s "$_pd/$_pn.ts" ]; do _pn=$((_pn + 1)); done
+        if [ "$_pn" -gt "$_ptotal" ] || [ "$_pn" -gt $((_pos + ahead)) ]; then sleep 1; continue; fi
+        # a segment that keeps failing is skipped after 3 tries (VLC gets a 404 for it)
+        if [ "$_pn" = "$_fail" ] && [ "$_tries" -ge 3 ]; then
+            _pn=$((_pn + 1))
+            [ "$_pn" -gt "$_ptotal" ] && { sleep 1; continue; }
+        fi
         set --
         _k=0
         while [ $_k -lt 4 ] && [ $((_pn + _k)) -le "$_ptotal" ]; do
@@ -209,27 +219,38 @@ prefetch() { # ID
             [ -s "$_pd/$_m.ts" ] || set -- "$@" "$(sed -n "${_m}p" "$www/$_pid.urls")" -o "$_pd/$_m.ts.part"
             _k=$((_k + 1))
         done
-        if [ $# -gt 0 ]; then
-            # publish each segment as soon as its own transfer ends, not after the whole batch
-            curl -sfL --connect-timeout 15 --max-time 180 -A "$agent" -e "$_pref" \
-                -w '%{exitcode} %{size_download} %{filename_effective}\n' "$@" 2>/dev/null |
-                while read -r _rc _sz _f; do
-                    _b="${_f##*/}"; _b="${_b%.ts.part}"
-                    if [ "$_rc" = 0 ] && [ -s "$_f" ]; then
-                        mv -f "$_f" "${_f%.part}"
-                        echo "$(date +%T) seg $_b buffered $_sz bytes" >>"$proxy_log"
-                    else
-                        rm -f "$_f"
-                        echo "$(date +%T) seg $_b FAILED (curl exit $_rc)" >>"$proxy_log"
-                    fi
-                done
-        fi
-        # continue after the segments that made it; retry a failed one a few times, then skip it
-        while [ "$_pn" -le "$_ptotal" ] && [ -s "$_pd/$_pn.ts" ]; do _pn=$((_pn + 1)) _tries=0; done
-        if [ "$_pn" -le "$_ptotal" ] && [ $# -gt 0 ]; then
-            _tries=$((_tries + 1))
-            if [ $_tries -ge 3 ]; then _pn=$((_pn + 1)) _tries=0; else sleep 2; fi
-        fi
+        _last=$((_pn + _k - 1))
+        # curl prints one line per finished transfer; publish each segment as soon as it is done
+        : >"$_wo"
+        curl -sfL --connect-timeout 15 --max-time 180 -A "$agent" -e "$_pref" \
+            -w '%{exitcode} %{size_download} %{filename_effective}\n' "$@" >"$_wo" 2>/dev/null &
+        _cp=$!
+        while :; do
+            kill -0 "$_cp" 2>/dev/null && _alive=1 || _alive=""
+            while read -r _rc _sz _f; do
+                [ -e "$_f" ] || continue
+                _b="${_f##*/}"; _b="${_b%.ts.part}"
+                if [ "$_rc" = 0 ] && [ -s "$_f" ]; then
+                    mv -f "$_f" "${_f%.part}"
+                    echo "$(date +%T) seg $_b buffered $_sz bytes" >>"$proxy_log"
+                else
+                    rm -f "$_f"
+                    echo "$(date +%T) seg $_b FAILED (curl exit $_rc)" >>"$proxy_log"
+                fi
+            done <"$_wo"
+            [ -n "$_alive" ] || break
+            # VLC jumped away from this batch: drop it and start from the new position
+            _p=$(vlc_pos "$_pid")
+            if [ "$_p" -gt "$_last" ] || { [ "$_p" -gt 0 ] && [ "$_p" -lt "$_pos" ]; }; then
+                kill "$_cp" 2>/dev/null
+                echo "$(date +%T) VLC moved to seg $_p, restarting downloads there" >>"$proxy_log"
+            fi
+            sleep 1
+        done
+        rm -f "$_pd"/*.part
+        if [ -s "$_pd/$_pn.ts" ]; then _fail="" _tries=0
+        elif [ "$_pn" = "$_fail" ]; then _tries=$((_tries + 1)); sleep 2
+        else _fail=$_pn _tries=1; sleep 2; fi
     done
 }
 
@@ -315,7 +336,7 @@ prepare_local() {
     # drop older episodes' files
     for _old in "$www"/[0-9]*.urls; do
         [ -e "$_old" ] || continue
-        _b="${_old%.urls}"; rm -rf "$_b" "$_b.m3u8" "$_b.urls" "$_b.ref" "$_b.vtt"
+        _b="${_old%.urls}"; rm -rf "$_b" "$_b.m3u8" "$_b.urls" "$_b.ref" "$_b.vtt" "$_b.wout"
     done
     mkdir -p "$www/$_id"
     printf '%s' "$stream_ref" >"$www/$_id.ref"

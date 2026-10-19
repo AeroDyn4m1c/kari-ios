@@ -99,6 +99,7 @@ History is stored in `~/.local/state/kari/history`.
 
 - **VLC opens but nothing plays / stops after a few seconds.** iSH was suspended. Allow location access for iSH (Settings → iSH → Location → **Always**), and don't force-close iSH while watching. To see what the proxy did, run `cat ~/.cache/kari/proxy.log` (every video segment kari downloaded) and `cat ~/.cache/kari/httpd.log` (every request VLC made).
 - **"Can't connect to the video server"**: the video CDN did not answer within 20 seconds. Your Wi-Fi or internet provider may be blocking it; try another network.
+- **Playback stops after skipping ahead.** kari only downloads a little ahead of VLC, so after a big skip VLC first asks for a part that isn't there yet. kari starts downloading from the new position right away; wait about 10 seconds, then skip to the same spot again or tap the link in iSH again.
 - **"Warning: test download through the proxy failed"**: kari still shows the VLC link, so try it. If VLC does not play, report the warning line together with `cat ~/.cache/kari/proxy.log`.
 - **Slow to start.** Run `KARI_DEBUG=1 kari frieren` to see which step takes long. Lower quality (`kari -q 720 ...`) also buffers faster.
 - **"Episode N (dub) is not available"**: that episode has no dub yet. Switch to sub.
