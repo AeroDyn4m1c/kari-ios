@@ -4,9 +4,9 @@
 # A POSIX-shell port of the anime flow of kari (https://github.com/dhairya3391/kari):
 #   AniList search -> Megaplay embed (by MAL id) -> AES token decrypt -> signed HLS
 # VLC for iOS cannot send the Referer header the CDN requires, so on iSH the
-# stream is played through a tiny local proxy (busybox httpd + CGI) that adds it.
+# stream is played through a tiny local proxy (busybox nc + a shell handler) that adds it.
 
-version_number="1.2.2"
+version_number="1.3.0"
 
 # ---------- configuration (override with environment variables) ----------
 mode="${KARI_MODE:-sub}"                    # sub | dub
@@ -74,7 +74,7 @@ dep_check() {
         has "$d" || die "Missing dependency: $d  (on iSH: apk add curl jq openssl)"
     done
     if [ "$player" = "iSH" ]; then
-        httpd_cmd >/dev/null || die "Missing busybox httpd  (on iSH: apk add busybox-extras)"
+        nc_cmd >/dev/null || die "Missing busybox nc with -e  (on iSH: apk add busybox)"
     fi
 }
 
@@ -140,21 +140,78 @@ sign_cdn_url() {
 }
 
 # ---------- local proxy (iSH) ----------
-# busybox httpd serves the playlist and video segments as plain files (its CGI
-# support hangs on iSH). A background prefetcher downloads the segments, with the
-# Referer header VLC can't send, into ID/N.ts ahead of what VLC last asked for,
-# which it reads from httpd's request log. Each batch reuses one connection,
-# which matters on iSH where every TLS handshake is slow.
+# A tiny HTTP server (busybox nc runs one shell handler per connection) serves the
+# playlist and video segments from $www. A background prefetcher downloads the
+# segments, with the Referer header VLC can't send, into ID/N.ts ahead of what VLC
+# last asked for, which it reads from the request log. A segment that isn't there
+# yet is waited for, never answered with 404: VLC treats a 404 as the end of the
+# video. Each prefetch batch reuses one connection, which matters on iSH where
+# every TLS handshake is slow. (busybox httpd can't be used: on iSH its CGI
+# responses hang, and plain files can only be answered with 404 while missing.)
 www="$cache_dir/www"
 proxy_log="$cache_dir/proxy.log"
-httpd_log="$cache_dir/httpd.log"
+req_log="$cache_dir/requests.log"
 ahead="${KARI_AHEAD:-8}" # segments to keep buffered ahead of VLC (~10s each)
 
-httpd_cmd() {
-    if has busybox-extras && busybox-extras --list 2>/dev/null | grep -qx httpd; then echo "busybox-extras httpd"
-    elif has busybox && busybox --list 2>/dev/null | grep -qx httpd; then echo "busybox httpd"
-    elif has httpd && httpd --help 2>&1 | grep -qi busybox; then echo "httpd"
+nc_cmd() {
+    if has busybox && busybox nc --help 2>&1 | grep -q 'persistent server'; then echo "busybox nc"
+    elif has nc && nc --help 2>&1 | grep -q 'persistent server'; then echo "nc"
     else return 1; fi
+}
+
+# Write the per-connection handler: answers one HTTP request on stdin/stdout.
+write_server() { # FILE
+    cat >"$1" <<'EOF'
+#!/bin/sh
+# kari: answer one HTTP GET (run by busybox nc -lk -e, socket on stdin/stdout)
+www="$1" log="$2"
+cr=$(printf '\r')
+read -r _m path _v || exit 0
+start=0
+while IFS= read -r h; do
+    h="${h%"$cr"}"
+    [ -z "$h" ] && break
+    case "$h" in [Rr]ange:*bytes=*) start="${h#*bytes=}"; start="${start%%-*}" ;; esac
+done
+case "$start" in '' | *[!0-9]*) start=0 ;; esac
+path="${path%%\?*}"
+case "$path" in *..*) path=/ ;; esac
+echo "$(date +%T) url:$path" >>"$log"
+f="$www$path"
+case "$path" in
+    *.ts)
+        type=video/mp2t
+        # still downloading: wait (up to 2 minutes) while the episode is current
+        i=0
+        while [ ! -s "$f" ] && [ -d "${f%/*}" ] && [ $i -lt 240 ]; do sleep 0.5; i=$((i + 1)); done
+        ;;
+    *.m3u8) type=application/vnd.apple.mpegurl ;;
+    *.vtt) type=text/vtt ;;
+    *) type=text/plain ;;
+esac
+if [ ! -f "$f" ] || [ ! -s "$f" ]; then
+    echo "$(date +%T) response:404 $path" >>"$log"
+    printf 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+    exit 0
+fi
+len=$(($(wc -c <"$f")))
+if [ "$start" -gt 0 ] && [ "$start" -lt "$len" ]; then
+    printf 'HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nContent-Length: %s\r\nContent-Range: bytes %s-%s/%s\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n' \
+        "$type" $((len - start)) "$start" $((len - 1)) "$len"
+    exec tail -c +$((start + 1)) "$f"
+fi
+printf 'HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %s\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n' "$type" "$len"
+exec cat "$f"
+EOF
+    chmod +x "$1"
+}
+
+# Start the server for DIR on PORT, logging requests to LOG; sets server_pid.
+start_server() { # DIR PORT LOG
+    _nc=$(nc_cmd) || die "busybox nc with -e not found (on iSH: apk add busybox)"
+    write_server "$cache_dir/serve"
+    $_nc -lk -s 127.0.0.1 -p "$2" -e "$cache_dir/serve" "$1" "$3" >/dev/null 2>&1 &
+    server_pid=$!
 }
 
 start_proxy() {
@@ -163,13 +220,12 @@ start_proxy() {
     rm -rf "$www"/[0-9]* "$www/cgi-bin"
     printf 'kari\n' >"$www/kari.txt"
     : >"$proxy_log"
-    printf '.m3u8:application/vnd.apple.mpegurl\n.vtt:text/vtt\n.ts:video/mp2t\n' >"$cache_dir/httpd.conf"
-    # a server left over from an earlier run would not log to this run's httpd.log
+    : >"$req_log"
+    # a server left over from an earlier run would not log to this run's request log
+    pkill -f "nc -lk -s 127\.0\.0\.1 -p $port " 2>/dev/null && sleep 1
     pkill -f "httpd -f .*127\.0\.0\.1:$port" 2>/dev/null && sleep 1
-    _h=$(httpd_cmd) || die "busybox httpd not found (apk add busybox-extras)"
-    : >"$httpd_log"
-    $_h -f -vv -p "127.0.0.1:$port" -h "$www" -c "$cache_dir/httpd.conf" >>"$httpd_log" 2>&1 &
-    proxy_pid=$!
+    start_server "$www" "$port" "$req_log"
+    proxy_pid=$server_pid
     _i=0
     while [ $_i -lt 20 ]; do
         curl -s --max-time 2 "http://127.0.0.1:$port/kari.txt" 2>/dev/null | grep -qx kari && { proxy_ready=1; return 0; }
@@ -181,7 +237,7 @@ start_proxy() {
 
 # Segment of episode ID that VLC asked for last (0 before it asked for any).
 vlc_pos() { # ID
-    _vp=$(grep -ao "url:/$1/[0-9]*\.ts" "$httpd_log" 2>/dev/null | tail -n 1 | sed 's#.*/##; s#\.ts$##')
+    _vp=$(grep -ao "url:/$1/[0-9]*\.ts" "$req_log" 2>/dev/null | tail -n 1 | sed 's#.*/##; s#\.ts$##')
     printf '%s' "${_vp:-0}"
 }
 
@@ -548,30 +604,26 @@ play_and_pause() {
 }
 
 # ---------- proxy diagnostics (kari --test-proxy) ----------
-# Times plain files and CGI responses through a separate, verbose busybox httpd,
-# to see which kinds of responses reach the client on this device.
+# Times the local server on this device: plain files, and a segment that only
+# appears after 3 seconds (which must be waited for, not answered with 404).
 test_proxy() {
-    _h=$(httpd_cmd) || die "busybox httpd not found (apk add busybox-extras)"
     _tp=$((port + 1))
     _tw="$cache_dir/proxy-test"
     _tlog="$cache_dir/proxy-test.log"
-    rm -rf "$_tw"; mkdir -p "$_tw/cgi-bin"
+    rm -rf "$_tw"; mkdir -p "$_tw/1"
+    : >"$_tlog"
     printf 'ok\n' >"$_tw/small.txt"
     head -c 800000 /dev/urandom >"$_tw/big.ts"
-    printf '#!/bin/sh\nprintf "Content-Type: text/plain\\r\\n\\r\\nok\\n"\n' >"$_tw/cgi-bin/tiny"
-    printf '#!/bin/sh\nprintf "Content-Type: video/mp2t\\r\\nContent-Length: 800000\\r\\n\\r\\n"\nexec cat "%s/big.ts"\n' "$_tw" >"$_tw/cgi-bin/big"
-    printf '#!/bin/sh\nprintf "Status: 302 Found\\r\\nLocation: http://127.0.0.1:%s/big.ts\\r\\nContent-Length: 0\\r\\n\\r\\n"\n' "$_tp" >"$_tw/cgi-bin/redirect"
-    chmod +x "$_tw/cgi-bin/"*
-    $_h -f -vv -p "127.0.0.1:$_tp" -h "$_tw" >"$_tlog" 2>&1 &
-    _tpid=$!
+    start_server "$_tw" "$_tp" "$_tlog"
     sleep 2
-    info "kari $version_number, $($_h --help 2>&1 | head -n 1), $(uname -sm)"
-    for _t in small.txt big.ts cgi-bin/tiny cgi-bin/big cgi-bin/redirect; do
-        _r=$(curl -sL --max-time 15 -o /dev/null -w '%{http_code} %{size_download} %{time_total}' "http://127.0.0.1:$_tp/$_t")
-        printf '%-17s curl exit %s, http %s, %s bytes, %ss\n' "$_t" "$?" ${_r:-000 0 0}
+    info "kari $version_number, $(busybox 2>&1 | head -n 1), $(uname -sm)"
+    (sleep 3; head -c 800000 /dev/urandom >"$_tw/1/late.ts.part" && mv "$_tw/1/late.ts.part" "$_tw/1/late.ts") &
+    for _t in small.txt big.ts 1/late.ts; do
+        _r=$(curl -s --max-time 15 -o /dev/null -w '%{http_code} %{size_download} %{time_total}' "http://127.0.0.1:$_tp/$_t")
+        printf '%-10s curl exit %s, http %s, %s bytes, %ss\n' "$_t" "$?" ${_r:-000 0 0}
     done
-    kill "$_tpid" 2>/dev/null
-    info "httpd log ($_tlog):"
+    kill "$server_pid" 2>/dev/null
+    info "request log ($_tlog):"
     cat "$_tlog"
     exit 0
 }

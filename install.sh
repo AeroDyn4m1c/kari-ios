@@ -8,17 +8,18 @@ dest="${KARI_INSTALL_DIR:-/usr/local/bin}"
 if command -v apk >/dev/null 2>&1; then
     echo "Updating package lists..."
     apk update
-    echo "Installing dependencies (curl jq openssl fzf busybox-extras)..."
+    echo "Installing dependencies (curl jq openssl fzf)..."
     # apk can print "broken packages" warnings for unrelated packages; check the result below instead
-    apk add curl jq openssl fzf busybox-extras
+    apk add curl jq openssl fzf
 fi
 
 missing=""
 for d in curl jq openssl; do
     command -v "$d" >/dev/null 2>&1 || missing="$missing $d"
 done
-if command -v apk >/dev/null 2>&1 && ! busybox-extras --list 2>/dev/null | grep -qx httpd; then
-    missing="$missing busybox-extras"
+# kari's local server for VLC uses busybox nc -e (part of iSH's base system)
+if command -v apk >/dev/null 2>&1 && ! busybox nc --help 2>&1 | grep -q 'persistent server'; then
+    missing="$missing busybox"
 fi
 if [ -n "$missing" ]; then
     echo "Could not install:$missing"

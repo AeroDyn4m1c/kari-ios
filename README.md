@@ -27,13 +27,13 @@ apk add curl
 curl -sL https://raw.githubusercontent.com/AeroDyn4m1c/kari-ios/main/install.sh | sh
 ```
 
-This installs the dependencies (`curl jq openssl fzf busybox-extras`) and puts `kari` in `/usr/local/bin`.
+This installs the dependencies (`curl jq openssl fzf`) and puts `kari` in `/usr/local/bin`.
 
 <details>
 <summary>Manual install</summary>
 
 ```sh
-apk add curl jq openssl fzf busybox-extras
+apk add curl jq openssl fzf
 curl -sL https://raw.githubusercontent.com/AeroDyn4m1c/kari-ios/main/kari -o /usr/local/bin/kari
 chmod +x /usr/local/bin/kari
 ```
@@ -71,7 +71,7 @@ kari follows the same anime pipeline as the original kari's AniCine provider:
 3. Ask Megaplay for the sources and decrypt the AES token with `openssl`, which yields the HLS playlist.
 4. Sign the CDN URL (HMAC-SHA256), as kari does.
 
-The stream's CDN refuses any request without a `Referer` header, and VLC for iOS can't send one. On iSH, kari therefore downloads the video segments itself (with the header), a little ahead of where VLC is, and serves them with busybox `httpd` on `127.0.0.1:8642`. VLC plays `http://127.0.0.1:8642/...`. (httpd's CGI scripts hang on iSH, so kari serves plain files only.)
+The stream's CDN refuses any request without a `Referer` header, and VLC for iOS can't send one. On iSH, kari therefore downloads the video segments itself (with the header), a little ahead of where VLC is, and serves them on `127.0.0.1:8642` with a tiny server (busybox `nc` running a shell script per request). VLC plays `http://127.0.0.1:8642/...`. When VLC asks for a part that isn't downloaded yet, for example after skipping ahead, the server waits for it instead of answering "not found", because VLC would treat that as the end of the video.
 
 A background job downloads the next ~80 seconds of video ahead of VLC, with the right headers and one connection per batch, because every new connection is slow inside iSH. Segments VLC has already played get deleted, so storage use stays small. All of this is why iSH has to stay alive in the background while VLC plays.
 
@@ -97,9 +97,9 @@ History is stored in `~/.local/state/kari/history`.
 
 ## Troubleshooting
 
-- **VLC opens but nothing plays / stops after a few seconds.** iSH was suspended. Allow location access for iSH (Settings → iSH → Location → **Always**), and don't force-close iSH while watching. To see what the proxy did, run `cat ~/.cache/kari/proxy.log` (every video segment kari downloaded) and `cat ~/.cache/kari/httpd.log` (every request VLC made).
+- **VLC opens but nothing plays / stops after a few seconds.** iSH was suspended. Allow location access for iSH (Settings → iSH → Location → **Always**), and don't force-close iSH while watching. To see what the proxy did, run `cat ~/.cache/kari/proxy.log` (every video segment kari downloaded) and `cat ~/.cache/kari/requests.log` (every request VLC made).
 - **"Can't connect to the video server"**: the video CDN did not answer within 20 seconds. Your Wi-Fi or internet provider may be blocking it; try another network.
-- **Playback stops after skipping ahead.** kari only downloads a little ahead of VLC, so after a big skip VLC first asks for a part that isn't there yet. kari starts downloading from the new position right away; wait about 10 seconds, then skip to the same spot again or tap the link in iSH again.
+- **Skipping ahead pauses for a few seconds.** kari only downloads a little ahead of VLC, so after a skip it first downloads the new part; VLC waits and then continues.
 - **"Warning: test download through the proxy failed"**: kari still shows the VLC link, so try it. If VLC does not play, report the warning line together with `cat ~/.cache/kari/proxy.log`.
 - **Slow to start.** Run `KARI_DEBUG=1 kari frieren` to see which step takes long. Lower quality (`kari -q 720 ...`) also buffers faster.
 - **"Episode N (dub) is not available"**: that episode has no dub yet. Switch to sub.
