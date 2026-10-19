@@ -6,7 +6,7 @@
 # VLC for iOS cannot send the Referer header the CDN requires, so on iSH the
 # stream is played through a tiny local proxy (busybox httpd + CGI) that adds it.
 
-version_number="1.2.1"
+version_number="1.2.2"
 
 # ---------- configuration (override with environment variables) ----------
 mode="${KARI_MODE:-sub}"                    # sub | dub
@@ -221,9 +221,10 @@ prefetch() { # ID
         done
         _last=$((_pn + _k - 1))
         # curl prints one line per finished transfer; publish each segment as soon as it is done
+        # (on stderr, which curl doesn't buffer; -s keeps its own messages off it)
         : >"$_wo"
         curl -sfL --connect-timeout 15 --max-time 180 -A "$agent" -e "$_pref" \
-            -w '%{exitcode} %{size_download} %{filename_effective}\n' "$@" >"$_wo" 2>/dev/null &
+            -w '%{stderr}%{exitcode} %{size_download} %{filename_effective}\n' "$@" >/dev/null 2>"$_wo" &
         _cp=$!
         while :; do
             kill -0 "$_cp" 2>/dev/null && _alive=1 || _alive=""
