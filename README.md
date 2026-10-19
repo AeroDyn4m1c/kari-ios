@@ -71,7 +71,7 @@ kari follows the same anime pipeline as the original kari's AniCine provider:
 3. Ask Megaplay for the sources and decrypt the AES token with `openssl`, which yields the HLS playlist.
 4. Sign the CDN URL (HMAC-SHA256), as kari does.
 
-The stream's CDN refuses any request without a `Referer` header, and VLC for iOS can't send one. On iSH, kari therefore starts a tiny proxy on `127.0.0.1:8642` (busybox `httpd` + a CGI script), and VLC plays `http://127.0.0.1:8642/...`.
+The stream's CDN refuses any request without a `Referer` header, and VLC for iOS can't send one. On iSH, kari therefore downloads the video segments itself (with the header), a little ahead of where VLC is, and serves them with busybox `httpd` on `127.0.0.1:8642`. VLC plays `http://127.0.0.1:8642/...`. (httpd's CGI scripts hang on iSH, so kari serves plain files only.)
 
 A background job downloads the next ~80 seconds of video ahead of VLC, with the right headers and one connection per batch, because every new connection is slow inside iSH. Segments VLC has already played get deleted, so storage use stays small. All of this is why iSH has to stay alive in the background while VLC plays.
 
@@ -97,12 +97,13 @@ History is stored in `~/.local/state/kari/history`.
 
 ## Troubleshooting
 
-- **VLC opens but nothing plays / stops after a few seconds.** iSH was suspended. Allow location access for iSH (Settings → iSH → Location → **Always**), and don't force-close iSH while watching. To see what the proxy did, run `cat ~/.cache/kari/proxy.log`: every line is one piece of video VLC asked for.
+- **VLC opens but nothing plays / stops after a few seconds.** iSH was suspended. Allow location access for iSH (Settings → iSH → Location → **Always**), and don't force-close iSH while watching. To see what the proxy did, run `cat ~/.cache/kari/proxy.log` (every video segment kari downloaded) and `cat ~/.cache/kari/httpd.log` (every request VLC made).
 - **"Can't connect to the video server"**: the video CDN did not answer within 20 seconds. Your Wi-Fi or internet provider may be blocking it; try another network.
 - **"Warning: test download through the proxy failed"**: kari still shows the VLC link, so try it. If VLC does not play, report the warning line together with `cat ~/.cache/kari/proxy.log`.
 - **Slow to start.** Run `KARI_DEBUG=1 kari frieren` to see which step takes long. Lower quality (`kari -q 720 ...`) also buffers faster.
 - **"Episode N (dub) is not available"**: that episode has no dub yet. Switch to sub.
-- **"Local proxy failed to start"**: another program is using the port. Run `KARI_PORT=8700 kari`.
+- **"Could not download the first video segments"**: the video server didn't deliver the start of the episode within 2 minutes. `proxy.log` shows the curl error for each segment.
+- **"Local proxy failed to start"**: another program is using the port. Run `KARI_PORT=8700 kari`. `kari --test-proxy` checks what the local server can serve on your device.
 - **Nothing tappable appears**: update iSH. Older versions don't support terminal links.
 - **Search or playback suddenly stops working**: the upstream site probably changed. Run `kari -U` to get the latest fixes.
 

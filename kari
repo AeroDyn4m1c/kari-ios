@@ -6,7 +6,7 @@
 # VLC for iOS cannot send the Referer header the CDN requires, so on iSH the
 # stream is played through a tiny local proxy (busybox httpd + CGI) that adds it.
 
-version_number="1.1.5"
+version_number="1.2.0"
 
 # ---------- configuration (override with environment variables) ----------
 mode="${KARI_MODE:-sub}"                    # sub | dub
@@ -140,12 +140,14 @@ sign_cdn_url() {
 }
 
 # ---------- local proxy (iSH) ----------
-# VLC asks the proxy for f?ID-N.ts. A background prefetcher downloads the next
-# segments ahead of playback (reusing one connection per batch, which matters on
-# iSH where every TLS handshake is slow) into ID/N.ts; the CGI redirects to those
-# files (served by httpd itself), fetching the segment first after a seek.
+# busybox httpd serves the playlist and video segments as plain files (its CGI
+# support hangs on iSH). A background prefetcher downloads the segments, with the
+# Referer header VLC can't send, into ID/N.ts ahead of what VLC last asked for,
+# which it reads from httpd's request log. Each batch reuses one connection,
+# which matters on iSH where every TLS handshake is slow.
 www="$cache_dir/www"
 proxy_log="$cache_dir/proxy.log"
+httpd_log="$cache_dir/httpd.log"
 ahead="${KARI_AHEAD:-8}" # segments to keep buffered ahead of VLC (~10s each)
 
 httpd_cmd() {
@@ -156,47 +158,17 @@ httpd_cmd() {
 }
 
 start_proxy() {
-    mkdir -p "$www/cgi-bin"
-    if [ -z "$proxy_ready" ]; then
-        rm -rf "$www"/[0-9]*
-        printf 'kari\n' >"$www/kari.txt"
-        : >"$proxy_log"
-    fi
+    [ -n "$proxy_ready" ] && return 0
+    mkdir -p "$www"
+    rm -rf "$www"/[0-9]* "$www/cgi-bin"
+    printf 'kari\n' >"$www/kari.txt"
+    : >"$proxy_log"
     printf '.m3u8:application/vnd.apple.mpegurl\n.vtt:text/vtt\n.ts:video/mp2t\n' >"$cache_dir/httpd.conf"
-    cat >"$www/cgi-bin/f" <<EOF
-#!/bin/sh
-q="\$QUERY_STRING"; id="\${q%%-*}"; n="\${q#*-}"; n="\${n%.ts}"
-case "\$id" in ''|*[!0-9]*) printf 'Status: 400 Bad Request\r\n\r\n'; exit 0;; esac
-case "\$n" in ''|*[!0-9]*) printf 'Status: 400 Bad Request\r\n\r\n'; exit 0;; esac
-d="$www/\$id"; f="\$d/\$n.ts"
-[ -d "\$d" ] || { printf 'Status: 404 Not Found\r\n\r\n'; exit 0; }
-printf '%s\n' "\$n" >"$www/\$id.pos"
-i=0
-while [ ! -s "\$f" ] && [ -e "\$f.part" ] && [ \$i -lt 60 ]; do sleep 0.5; i=\$((i + 1)); done
-src=buffer
-if [ ! -s "\$f" ]; then
-    src=direct
-    url=\$(sed -n "\${n}p" "$www/\$id.urls")
-    [ -z "\$url" ] && { printf 'Status: 404 Not Found\r\n\r\n'; exit 0; }
-    if curl -sfL --connect-timeout 15 --max-time 60 -A '$agent' -e "\$(cat "$www/\$id.ref")" -o "\$f.cgi" "\$url" && [ -s "\$f.cgi" ]; then
-        mv -f "\$f.cgi" "\$f"
-    else
-        rm -f "\$f.cgi"
-        echo "\$(date +%T) seg \$n FAILED (curl)" >>"$proxy_log"
-        printf 'Status: 502 Bad Gateway\r\n\r\n'; exit 0
-    fi
-fi
-len=\$(wc -c <"\$f")
-echo "\$(date +%T) seg \$n \$src \$len bytes" >>"$proxy_log"
-# on iSH httpd stalls passing a large CGI response through, so redirect to the file instead
-printf 'Status: 302 Found\r\nLocation: http://127.0.0.1:$port/%s/%s.ts\r\nContent-Length: 0\r\n\r\n' "\$id" "\$n"
-EOF
-    chmod +x "$www/cgi-bin/f"
-    # a server already answering for kari (e.g. left over from an earlier run) serves the same directory
-    if curl -s --max-time 2 "http://127.0.0.1:$port/kari.txt" 2>/dev/null | grep -qx kari; then proxy_ready=1; return 0; fi
-    [ -n "$proxy_pid" ] && kill "$proxy_pid" 2>/dev/null
+    # a server left over from an earlier run would not log to this run's httpd.log
+    pkill -f "httpd -f .*127\.0\.0\.1:$port" 2>/dev/null && sleep 1
     _h=$(httpd_cmd) || die "busybox httpd not found (apk add busybox-extras)"
-    $_h -f -p "127.0.0.1:$port" -h "$www" -c "$cache_dir/httpd.conf" >/dev/null 2>&1 &
+    : >"$httpd_log"
+    $_h -f -vv -p "127.0.0.1:$port" -h "$www" -c "$cache_dir/httpd.conf" >>"$httpd_log" 2>&1 &
     proxy_pid=$!
     _i=0
     while [ $_i -lt 20 ]; do
@@ -207,16 +179,21 @@ EOF
     die "Local proxy failed to start on port $port (is it in use? set KARI_PORT)"
 }
 
+# Segment of episode ID that VLC asked for last (0 before it asked for any).
+vlc_pos() { # ID
+    _vp=$(grep -ao "url:/$1/[0-9]*\.ts" "$httpd_log" 2>/dev/null | tail -n 1 | sed 's#.*/##; s#\.ts$##')
+    printf '%s' "${_vp:-0}"
+}
+
 # Download segments of episode ID ahead of the position VLC last asked for.
 prefetch() { # ID
     _pid="$1"
     _pd="$www/$_pid"
     _ptotal=$(wc -l <"$www/$_pid.urls")
     _pref=$(cat "$www/$_pid.ref")
-    _pn=1
+    _pn=1 _tries=0
     while [ "$_pn" -le "$_ptotal" ] && [ -d "$_pd" ]; do
-        _pos=$(cat "$www/$_pid.pos" 2>/dev/null)
-        case "$_pos" in '' | *[!0-9]*) _pos=0 ;; esac
+        _pos=$(vlc_pos "$_pid")
         [ "$_pn" -lt "$_pos" ] && _pn=$_pos # VLC seeked forward
         if [ "$_pn" -gt $((_pos + ahead)) ]; then sleep 1; continue; fi
         # forget segments well behind the viewer
@@ -226,25 +203,33 @@ prefetch() { # ID
             [ "$_b" -lt $((_pos - 2)) ] && rm -f "$_f"
         done
         set --
-        _batch=""
         _k=0
         while [ $_k -lt 4 ] && [ $((_pn + _k)) -le "$_ptotal" ]; do
             _m=$((_pn + _k))
-            if [ ! -s "$_pd/$_m.ts" ]; then
-                : >"$_pd/$_m.ts.part"
-                set -- "$@" "$(sed -n "${_m}p" "$www/$_pid.urls")" -o "$_pd/$_m.ts.part"
-                _batch="$_batch $_m"
-            fi
+            [ -s "$_pd/$_m.ts" ] || set -- "$@" "$(sed -n "${_m}p" "$www/$_pid.urls")" -o "$_pd/$_m.ts.part"
             _k=$((_k + 1))
         done
-        if [ -n "$_batch" ]; then
-            curl -sfL --connect-timeout 15 --max-time 180 -A "$agent" -e "$_pref" "$@" 2>/dev/null
-            for _m in $_batch; do
-                if [ -s "$_pd/$_m.ts.part" ]; then mv -f "$_pd/$_m.ts.part" "$_pd/$_m.ts"
-                else rm -f "$_pd/$_m.ts.part"; echo "$(date +%T) prefetch seg $_m FAILED" >>"$proxy_log"; fi
-            done
+        if [ $# -gt 0 ]; then
+            # publish each segment as soon as its own transfer ends, not after the whole batch
+            curl -sfL --connect-timeout 15 --max-time 180 -A "$agent" -e "$_pref" \
+                -w '%{exitcode} %{size_download} %{filename_effective}\n' "$@" 2>/dev/null |
+                while read -r _rc _sz _f; do
+                    _b="${_f##*/}"; _b="${_b%.ts.part}"
+                    if [ "$_rc" = 0 ] && [ -s "$_f" ]; then
+                        mv -f "$_f" "${_f%.part}"
+                        echo "$(date +%T) seg $_b buffered $_sz bytes" >>"$proxy_log"
+                    else
+                        rm -f "$_f"
+                        echo "$(date +%T) seg $_b FAILED (curl exit $_rc)" >>"$proxy_log"
+                    fi
+                done
         fi
-        _pn=$((_pn + _k))
+        # continue after the segments that made it; retry a failed one a few times, then skip it
+        while [ "$_pn" -le "$_ptotal" ] && [ -s "$_pd/$_pn.ts" ]; do _pn=$((_pn + 1)) _tries=0; done
+        if [ "$_pn" -le "$_ptotal" ] && [ $# -gt 0 ]; then
+            _tries=$((_tries + 1))
+            if [ $_tries -ge 3 ]; then _pn=$((_pn + 1)) _tries=0; else sleep 2; fi
+        fi
     done
 }
 
@@ -330,13 +315,13 @@ prepare_local() {
     # drop older episodes' files
     for _old in "$www"/[0-9]*.urls; do
         [ -e "$_old" ] || continue
-        _b="${_old%.urls}"; rm -rf "$_b" "$_b.m3u8" "$_b.urls" "$_b.ref" "$_b.vtt" "$_b.pos"
+        _b="${_old%.urls}"; rm -rf "$_b" "$_b.m3u8" "$_b.urls" "$_b.ref" "$_b.vtt"
     done
     mkdir -p "$www/$_id"
     printf '%s' "$stream_ref" >"$www/$_id.ref"
     : >"$www/$_id.urls"
     printf '%s\n' "$_m" | tr -d '\r' | awk -v origin="$_origin" -v dir="$_dir" -v urls="$www/$_id.urls" \
-        -v proxy="http://127.0.0.1:$port/cgi-bin/f?$_id-" '
+        -v proxy="http://127.0.0.1:$port/$_id/" '
         function abs(u) {
             if (u ~ /^https?:\/\//) return u
             if (u ~ /^\//) return origin u
@@ -377,21 +362,28 @@ prepare_local() {
         get -e "$stream_ref" -o "$www/$_id.vtt" "$sub_url" && local_sub="http://127.0.0.1:$port/$_id.vtt"
     fi
 
-    # Self-test: fetch the playlist and first segment through the proxy like VLC will.
+    # VLC gets a 404 for a segment that isn't downloaded yet, so wait for the first few.
     step "Buffering..."
     _t=$(date +%s)
     if ! curl -sf --max-time 10 -o /dev/null "$local_url"; then
         info "The local proxy is not serving the playlist (see $proxy_log)."
         return 1
     fi
+    _need=$(wc -l <"$www/$_id.urls")
+    [ "$_need" -gt 3 ] && _need=3
+    while [ ! -s "$www/$_id/$_need.ts" ]; do
+        if ! kill -0 "$prefetch_pid" 2>/dev/null || [ $(($(date +%s) - _t)) -ge 120 ]; then
+            info "Could not download the first video segments (see $proxy_log)."
+            return 1
+        fi
+        sleep 1
+    done
+    # fetch the first segment like VLC will
     _first=$(awk '!/^#/ && NF { print; exit }' "$www/$_id.m3u8")
-    _res=$(curl -sL --max-time 90 -o /dev/null -w '%{http_code} %{size_download}' "$_first")
+    _res=$(curl -s --max-time 30 -o /dev/null -w '%{http_code} %{size_download}' "$_first")
     _rc=$?
     _code=${_res%% *} _len=${_res#* }
-    rm -f "$www/$_id.pos" # the self-test is not VLC's position
     echo "$(date +%T) self-test: curl exit $_rc, http $_code, $_len bytes" >>"$proxy_log"
-    # VLC may still manage when this test fails (iSH can break the connection to curl),
-    # so warn with the details instead of giving up
     if [ "$_rc" -ne 0 ] || [ "$_code" != 200 ] || [ "${_len:-0}" -lt 1000 ]; then
         info "Warning: test download through the proxy failed (curl exit $_rc, http $_code, $_len bytes)."
         info "Try VLC anyway; if it doesn't play, send this line and $proxy_log."
