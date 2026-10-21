@@ -6,7 +6,7 @@
 # VLC for iOS cannot send the Referer header the CDN requires, so on iSH the
 # stream is played through a tiny local proxy (busybox nc + a shell handler) that adds it.
 
-version_number="1.3.0"
+version_number="1.3.1"
 
 # ---------- configuration (override with environment variables) ----------
 mode="${KARI_MODE:-sub}"                    # sub | dub
@@ -80,14 +80,20 @@ dep_check() {
 
 # ---------- AniList ----------
 anilist() { # anilist QUERY VARIABLES_JSON
-    get -X POST "$anilist_api" -H 'Content-Type: application/json' -H 'Accept: application/json' \
-        -d "$(jq -cn --arg q "$1" --argjson v "$2" '{query:$q,variables:$v}')"
+    # no -f: on errors AniList answers with an HTTP error and a JSON message worth showing
+    _ar=$(curl -sL --connect-timeout 15 --max-time 30 -A "$agent" -X POST "$anilist_api" \
+        -H 'Content-Type: application/json' -H 'Accept: application/json' \
+        -d "$(jq -cn --arg q "$1" --argjson v "$2" '{query:$q,variables:$v}')") || { info "Could not reach AniList."; return 1; }
+    _ae=$(printf '%s' "$_ar" | jq -r '.errors[0].message // empty' 2>/dev/null)
+    [ -n "$_ae" ] && { info "AniList error: $_ae"; return 1; }
+    printf '%s' "$_ar"
 }
 
 # Output lines: anilist_id<TAB>mal_id<TAB>episodes<TAB>title<TAB>label
 search_anime() {
-    anilist 'query($s:String){Page(page:1,perPage:30){media(search:$s,type:ANIME,sort:SEARCH_MATCH){id idMal format seasonYear episodes status nextAiringEpisode{episode} title{english romaji userPreferred}}}}' \
-        "$(jq -cn --arg s "$1" '{s:$s}')" |
+    _sr=$(anilist 'query($s:String){Page(page:1,perPage:30){media(search:$s,type:ANIME,sort:SEARCH_MATCH){id idMal format seasonYear episodes status nextAiringEpisode{episode} title{english romaji userPreferred}}}}' \
+        "$(jq -cn --arg s "$1" '{s:$s}')") || return 1
+    printf '%s' "$_sr" |
         jq -r '.data.Page.media[] | select(.idMal != null)
             | (.episodes // ((.nextAiringEpisode.episode // 1) - 1)) as $n
             | (.title.english // .title.userPreferred // .title.romaji) as $t
@@ -151,7 +157,7 @@ sign_cdn_url() {
 www="$cache_dir/www"
 proxy_log="$cache_dir/proxy.log"
 req_log="$cache_dir/requests.log"
-ahead="${KARI_AHEAD:-8}" # segments to keep buffered ahead of VLC (~10s each)
+ahead="${KARI_AHEAD:-20}" # segments to keep buffered ahead of VLC (a few seconds each)
 
 nc_cmd() {
     if has busybox && busybox nc --help 2>&1 | grep -q 'persistent server'; then echo "busybox nc"
@@ -181,9 +187,9 @@ f="$www$path"
 case "$path" in
     *.ts)
         type=video/mp2t
-        # still downloading: wait (up to 2 minutes) while the episode is current
+        # still downloading: wait (up to 10 minutes) while the episode is current
         i=0
-        while [ ! -s "$f" ] && [ -d "${f%/*}" ] && [ $i -lt 240 ]; do sleep 0.5; i=$((i + 1)); done
+        while [ ! -s "$f" ] && [ -d "${f%/*}" ] && [ $i -lt 1200 ]; do sleep 0.5; i=$((i + 1)); done
         ;;
     *.m3u8) type=application/vnd.apple.mpegurl ;;
     *.vtt) type=text/vtt ;;
@@ -279,7 +285,8 @@ prefetch() { # ID
         # curl prints one line per finished transfer; publish each segment as soon as it is done
         # (on stderr, which curl doesn't buffer; -s keeps its own messages off it)
         : >"$_wo"
-        curl -sfL --connect-timeout 15 --max-time 180 -A "$agent" -e "$_pref" \
+        # a stalled transfer (common on mobile data) is dropped after 15s and retried
+        curl -sfL --connect-timeout 15 --speed-limit 10000 --speed-time 15 -A "$agent" -e "$_pref" \
             -w '%{stderr}%{exitcode} %{size_download} %{filename_effective}\n' "$@" >/dev/null 2>"$_wo" &
         _cp=$!
         while :; do
@@ -534,7 +541,7 @@ search_and_pick() {
     [ -z "$query" ] && query=$(prompt "Search anime: ")
     [ -z "$query" ] && exit 0
     info "Searching \"$query\"..."
-    _results=$(search_anime "$query")
+    _results=$(search_anime "$query") || exit 1
     [ -z "$_results" ] && die "No results for \"$query\"."
     _pick=$(printf '%s\n' "$_results" | menu "Select anime: ") || exit 0
     anilist_id=$(printf '%s' "$_pick" | cut -f1)
